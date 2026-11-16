@@ -1,0 +1,31 @@
+name: desklink
+arch: all
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Jhordan Pastorello <jhordan@users.noreply.github.com>
+description: |
+  Mouse, teclado e area de transferencia compartilhados entre Windows e Linux (GNOME/Wayland).
+  Daemon do lado Linux: injeta input via /dev/uinput e sincroniza o clipboard.
+vendor: DeskLink
+homepage: https://github.com/jhordan-pastorello/trnspositor-tuch-teclado
+license: MIT
+contents:
+  - src: ./daemon/desklink_daemon.py
+    dst: /usr/lib/desklink/desklink_daemon.py
+    file_info: { mode: 0755 }
+  - src: ./packaging/linux/desklink.service
+    dst: /usr/lib/systemd/user/desklink.service
+  - src: ./packaging/linux/60-desklink-uinput.rules
+    dst: /usr/lib/udev/rules.d/60-desklink-uinput.rules
+  - src: ./packaging/linux/desklink-modules.conf
+    dst: /usr/lib/modules-load.d/desklink-uinput.conf
+scripts:
+  postinstall: ./packaging/linux/postinstall.sh
+  preremove: ./packaging/linux/preremove.sh
+overrides:
+  deb:
+    depends: [python3, openssl, wl-clipboard]
+  rpm:
+    depends: [python3, openssl, wl-clipboard]

@@ -32,6 +32,17 @@ PORT_TCP = 47810
 PORT_UDP = 47811
 DISCOVER_MAGIC = b"DESKLINK_DISCOVER1"
 
+# Cliente manda Heartbeat (msg 8) a cada ~5s. Silencio prolonged = cliente
+# morreu sem fechar o socket (notebook desligou/reiniciou, queda de rede) e o
+# daemon ficaria com self.conn apontando pra conexao morta, recusando todo
+# mundo novo.
+#
+# Margem: o cliente idealmente manda a cada ~5s, mas um cliente antigo/ocioso
+# pode mandar a cada ~30s (o TryTake do Pump bloqueia 30s). 90s = folga de 3x
+# pro pior caso e 18x pro caso nominal. Nao pode ser menor que o intervalo
+# real do cliente, senao derruba conexao saudavel.
+HEARTBEAT_TIMEOUT = 90.0
+
 CFG_DIR = os.path.expanduser("~/.config/desklink")
 CERT = os.path.join(CFG_DIR, "cert.pem")
 KEY = os.path.join(CFG_DIR, "key.pem")
@@ -281,6 +292,7 @@ class Daemon:
     def __init__(self):
         self.conn = None
         self.buf = b""
+        self.last_rx = time.time()
         self.last_clip_key = None
         self._send_lock = threading.Lock()
         self.remote_w, self.remote_h = detect_screen()
@@ -407,6 +419,7 @@ class Daemon:
                 try:
                     self.conn = ctx.wrap_socket(raw, server_side=True)
                     self.buf = b""
+                    self.last_rx = time.time()
                     log("conectado:", addr[0])
                 except (ssl.SSLError, OSError) as e:
                     log("TLS falhou:", e)
@@ -417,6 +430,22 @@ class Daemon:
                     self.conn = None
                 continue
 
+            # Cliente morto: o socket fica meio-aberto (notebook desligou ou a
+            # rede caiu) e o select() nao devolve EOF nunca, entao o daemon
+            # trava em self.conn e nao aceita mais ninguem. O cliente manda
+            # Heartbeat (msg 8) a cada ~5s, entao silencio = cliente morto.
+            silencio = time.time() - self.last_rx
+            if silencio > HEARTBEAT_TIMEOUT:
+                log("cliente sem heartbeat por %.0fs, derrubando conexao" % silencio)
+                self.leave()
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                self.buf = b""
+                continue
+
             try:
                 r, _, _ = select.select([self.conn], [], [], 0.2)
                 if self.conn not in r:
@@ -424,6 +453,7 @@ class Daemon:
                 chunk = self.conn.recv(65536)
                 if not chunk:
                     raise ConnectionError("fim")
+                self.last_rx = time.time()
                 self.buf += chunk
                 while len(self.buf) >= 5:
                     mt, ln = struct.unpack("<BI", self.buf[:5])

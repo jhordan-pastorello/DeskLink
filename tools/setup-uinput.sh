@@ -1,17 +1,17 @@
 #!/bin/bash
+# Configura /dev/uinput para quem NAO instalou pelo pacote .deb/.rpm.
+# Uso: sudo ./tools/setup-uinput.sh
 set -e
-cp /tmp/60-desklink-uinput.rules /etc/udev/rules.d/60-desklink-uinput.rules
-cp /tmp/desklink-modules.conf /etc/modules-load.d/desklink-uinput.conf
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+target="${SUDO_USER:-$USER}"
+
+cp "$here/../packaging/linux/60-desklink-uinput.rules" /etc/udev/rules.d/60-desklink-uinput.rules
+cp "$here/../packaging/linux/desklink-modules.conf" /etc/modules-load.d/desklink-uinput.conf
 modprobe uinput || true
-usermod -aG input storage
 udevadm control --reload-rules
-udevadm trigger --name-match=uinput --action=add || true
+udevadm trigger --subsystem-match=misc --action=add || true
 sleep 1
-chgrp input /dev/uinput
-chmod 0660 /dev/uinput
-setfacl -m u:storage:rw /dev/uinput
-echo "--- /dev/uinput ---"
+getent group input >/dev/null && usermod -aG input "$target"
+chgrp input /dev/uinput && chmod 0660 /dev/uinput
+command -v setfacl >/dev/null && setfacl -m "u:$target:rw" /dev/uinput || true
 ls -l /dev/uinput
-getfacl -p /dev/uinput 2>/dev/null | tail -3
-echo "--- grupos ---"
-id storage

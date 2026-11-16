@@ -92,7 +92,7 @@ usa o teclado/mouse físicos do servidor, não existe dispositivo DeskLink nenhu
 
 | Lado | Requisitos |
 |---|---|
-| **Windows** | Windows 10 v1809+ ou 11 · [.NET 10 Runtime](https://dotnet.microsoft.com/download) (ou SDK para compilar) |
+| **Windows** | Windows 10 v1809+ ou 11 (x64) |
 | **Linux** | GNOME em **Wayland** (testado no Ubuntu 26.04) · Python 3.8+ · `wl-clipboard` · acesso a `/dev/uinput` (grupo `input`, configurado uma vez) |
 
 Rede: as duas máquinas na mesma LAN (ou Tailscale/VPN), portas `47810/tcp` e `47811/udp`.
@@ -101,54 +101,61 @@ Rede: as duas máquinas na mesma LAN (ou Tailscale/VPN), portas `47810/tcp` e `4
 
 ## Instalação
 
-### 1. Linux
+Baixe os instaladores na página de [**Releases**](https://github.com/jhordan-pastorello/trnspositor-tuch-teclado/releases/latest).
+
+### Windows
+
+1. Baixe `DeskLink-Setup-<versão>.exe` e execute (pede permissão de administrador).
+2. Pronto: o agente inicia no logon, sem janela. Não precisa instalar o .NET (vem embutido).
+
+### Linux (GNOME/Wayland)
+
+Ubuntu/Debian:
 
 ```bash
-git clone https://github.com/jhordan-pastorello/trnspositor-tuch-teclado.git
-cd trnspositor-tuch-teclado
-
-sudo apt install wl-clipboard
-./tools/install-linux.sh        # daemon + systemd --user
-sudo ./tools/setup-uinput.sh    # UMA VEZ: módulo uinput, regra udev, grupo input
+sudo apt install ./desklink_<versão>_all.deb
 ```
 
-O `setup-uinput.sh` faz:
+Fedora/RHEL:
 
 ```bash
-cp tools/60-desklink-uinput.rules /etc/udev/rules.d/
-cp tools/desklink-modules.conf    /etc/modules-load.d/
-modprobe uinput
-usermod -aG input "$USER"
-udevadm control --reload-rules && udevadm trigger --name-match=uinput
-chgrp input /dev/uinput && chmod 0660 /dev/uinput
+sudo dnf install ./desklink-<versão>.noarch.rpm
 ```
 
-> Depois do `usermod` vale fazer logout/login para o grupo valer em todas as sessões.
-> O script já aplica uma ACL no device para funcionar imediatamente.
+O pacote instala o daemon, a regra udev do `/dev/uinput`, carrega o módulo `uinput` e ativa o
+serviço `systemd --user`. Dependências (`python3`, `openssl`, `wl-clipboard`) vêm automaticamente.
+Se o serviço não subir sozinho: `systemctl --user enable --now desklink`.
 
-Firewall (se usar `ufw`):
+Firewall (portas `47810/tcp` e `47811/udp`):
 
 ```bash
-sudo ufw allow from 192.168.1.0/24 to any port 47810 proto tcp comment DeskLink-TCP
-sudo ufw allow from 192.168.1.0/24 to any port 47811 proto udp comment DeskLink-Discovery
+# firewalld (Fedora)
+sudo firewall-cmd --permanent --add-port=47810/tcp --add-port=47811/udp && sudo firewall-cmd --reload
+# ufw (Ubuntu)
+sudo ufw allow from 192.168.0.0/16 to any port 47810 proto tcp
+sudo ufw allow from 192.168.0.0/16 to any port 47811 proto udp
 ```
 
-### 2. Windows
+### Instalação manual (a partir do código)
+
+```bash
+# Linux
+./tools/install-linux.sh && sudo ./tools/setup-uinput.sh
+```
 
 ```powershell
-git clone https://github.com/jhordan-pastorello/trnspositor-tuch-teclado.git
-cd trnspositor-tuch-teclado
-
-# PowerShell como Administrador
+# Windows (PowerShell como Administrador, requer .NET 10 SDK)
 .\tools\install-windows.ps1
 ```
 
-O script publica o binário em `%LOCALAPPDATA%\DeskLink\app` e registra a tarefa
-`DeskLink` (AtLogOn, `RunLevel Highest`, reinício automático). Nada abre na tela.
+### Publicar uma versão (mantenedores)
 
-> **Por que tarefa agendada e não serviço?** Serviços rodam na sessão 0 e **não** conseguem
-> capturar mouse/teclado do usuário. A tarefa no logon roda elevada dentro da sessão interativa,
-> que é o único lugar de onde os hooks funcionam — e ainda permite controlar janelas elevadas (UAC).
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+O workflow `release` compila o instalador Windows (Inno Setup), gera `.deb` e `.rpm` (nfpm),
+e anexa tudo, com `SHA256SUMS.txt`, à release.
 
 ---
 
