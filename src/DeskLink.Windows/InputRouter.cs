@@ -40,6 +40,7 @@ internal sealed class InputRouter
     private int _ivx;  // posicao virtual inbound (pode passar da borda de saida)
     private int _ivy;
     private int _inOverflow;
+    private bool _inboundReady;   // true apos o primeiro posicionamento (Pointer/PointerRel): so entao overflow conta
     private readonly HashSet<int> _inKeys = new();
     private readonly HashSet<int> _inButtons = new();
     private const int InboundExitOverflow = 40;
@@ -430,6 +431,12 @@ internal sealed class InputRouter
         _inboundEpoch = epoch;
         _inbound = true;
         _inOverflow = 0;
+        _inboundReady = false;
+        {
+            int w = Math.Max(2, _screenW), h = Math.Max(2, _screenH);
+            _ix = _ivx = w / 2;
+            _iy = _ivy = h / 2;
+        }
         _inKeys.Clear();
         _inButtons.Clear();
         _edgeSince = DateTime.MinValue;
@@ -451,7 +458,7 @@ internal sealed class InputRouter
             _ => -y
         };
 
-        if (over > 0)
+        if (over > 0 && _inboundReady)
         {
             _inOverflow = over;
             if (over >= InboundExitOverflow)
@@ -468,6 +475,7 @@ internal sealed class InputRouter
         _ix = Math.Clamp(x, 0, w - 1);
         _iy = Math.Clamp(y, 0, h - 1);
         SyncVirtual(x, y, w, h);
+        _inboundReady = true;
         px = _ix;
         py = _iy;
         return true;
@@ -564,6 +572,7 @@ internal sealed class InputRouter
             if (!_inbound) return;
             _inbound = false;
             _inOverflow = 0;
+            _inboundReady = false;
 
             // solta tudo o que o Linux deixou pressionado
             foreach (var code in _inKeys.ToArray())

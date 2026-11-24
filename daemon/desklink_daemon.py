@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import select
 import socket
 import ssl
@@ -328,12 +329,15 @@ def _bit(buf, n):
 
 
 class EvDev:
-    def __init__(self, path, fd, kind):
+    def __init__(self, path, fd, kind, name=""):
         self.path = path
         self.fd = fd
+        self.name = name
         self.kind = kind          # "mouse" | "keyboard"
         self.pressed = set()
         self.grabbed = False
+        self.grab_ok = True       # False: EVIOCGRAB falhou (ex.: EINVAL no Wayland); nao insiste
+        self.grab_skip = False
         self.dx = self.dy = self.wx = self.wy = 0
 
     def grab(self, on):
@@ -341,8 +345,12 @@ class EvDev:
             fcntl.ioctl(self.fd, EVIOCGRAB, 1 if on else 0)
             self.grabbed = on
         except OSError as e:
-            log("EVIOCGRAB falhou em", self.path, e)
-            if not on:
+            if on:
+                if not self.grab_skip:
+                    log("EVIOCGRAB falhou em", self.path, e, "(segue sem captura)")
+                self.grab_ok = False
+                self.grab_skip = True
+            else:
                 self.grabbed = False
 
     def close(self):
@@ -374,9 +382,9 @@ def classify_evdev(path):
         if _bit(types, EV_REL):
             fcntl.ioctl(fd, _eviocgbit(EV_REL, 8), rels)
         if _bit(rels, REL_X) and _bit(rels, REL_Y) and _bit(keys, BTN_LEFT):
-            return EvDev(path, fd, "mouse")
+            return EvDev(path, fd, "mouse", name)
         if _bit(keys, KEY_A) and _bit(keys, KEY_ENTER) and _bit(keys, KEY_SPACE):
-            return EvDev(path, fd, "keyboard")
+            return EvDev(path, fd, "keyboard", name)
     except OSError:
         pass
     os.close(fd)
@@ -456,7 +464,8 @@ class GuestInput(threading.Thread):
                 return
             self.pending = False
             self.guest = True
-        self.d.send(14, struct.pack("<ii", 0, 0))
+        # posicao absoluta inicial: alinha o cursor do Windows na entrada
+        self.d.send(3, struct.pack("<ii", int(self.gx), int(self.gy)))
         log("guest: controlando o Windows (borda %s)" % self.edge)
 
     def cancel_pending(self, reason, notify):
@@ -509,14 +518,34 @@ class GuestInput(threading.Thread):
 
     # ---- dispositivos ----
     def scan(self):
-        for path in glob.glob("/dev/input/event*"):
+        def evnum(p):
+            m = re.search(r"(\d+)$", p)
+            return int(m.group(1)) if m else 1 << 30
+
+        have = {k: any(x.kind == k for x in self.devs.values()) for k in ("mouse", "keyboard")}
+        found = {"mouse": [], "keyboard": []}
+        for path in sorted(glob.glob("/dev/input/event*"), key=evnum):
             if path in self.devs:
                 continue
             dev = classify_evdev(path)
-            if dev:
-                with self.lock:
-                    self.devs[path] = dev
-                log("guest: lendo %s (%s)" % (path, dev.kind))
+            if not dev:
+                continue
+            if have[dev.kind]:
+                dev.close()      # no maximo 1 mouse e 1 teclado
+                continue
+            found[dev.kind].append(dev)
+        for kind, devs in found.items():
+            if not devs:
+                continue
+            if kind == "keyboard":
+                # prefere Logitech/USB; senao o menor eventN (ja ordenado)
+                devs.sort(key=lambda x: 0 if re.search(r"logitech|usb", x.name, re.I) else 1)
+            dev = devs[0]
+            for x in devs[1:]:
+                x.close()
+            with self.lock:
+                self.devs[dev.path] = dev
+            log("guest: lendo %s (%s)" % (dev.path, dev.kind))
 
     def drop(self, dev):
         with self.lock:
@@ -536,7 +565,7 @@ class GuestInput(threading.Thread):
             if self.guest:
                 # so captura com tudo solto: soltar tecla "no escuro" deixaria
                 # a tecla presa no compositor
-                if not dev.grabbed and not dev.pressed:
+                if not dev.grabbed and not dev.grab_skip and not dev.pressed:
                     dev.grab(True)
             elif dev.grabbed and (not dev.pressed or now >= self.ungrab_deadline):
                 dev.grab(False)
@@ -570,7 +599,7 @@ class GuestInput(threading.Thread):
                     time.sleep(0.5)
                     continue
                 by_fd = {dev.fd: dev for dev in list(self.devs.values())}
-                r, _, _ = select.select(list(by_fd), [], [], 0.1)
+                r, _, _ = select.select(list(by_fd), [], [], 0.01 if self.guest else 0.1)
                 for fd in r:
                     dev = by_fd[fd]
                     try:
@@ -611,8 +640,8 @@ class GuestInput(threading.Thread):
                 if any(k in p for k in KEY_CTRL) and any(k in p for k in KEY_ALT):
                     self.exit(True, "Ctrl+Alt+Espaco")
                     return
-            if not dev.grabbed:
-                return
+            if not dev.grabbed and dev.grab_ok:
+                return        # captura ainda pendente (teclas pressionadas); sem grab_ok encaminha mesmo assim
             if code in BTN_REV:
                 d.send(4, struct.pack("<BB", BTN_REV[code], 1 if val else 0))
             elif code < 0x100:
@@ -633,11 +662,10 @@ class GuestInput(threading.Thread):
             if d.active:
                 return        # Windows controla o Linux: pausa
             if self.guest:
-                if dev.grabbed:
-                    if wx or wy:
-                        d.send(5, struct.pack("<ii", wx * 120, wy * 120))
-                    if dx or dy:
-                        self.guest_move(dx, dy)
+                if wx or wy:
+                    d.send(5, struct.pack("<ii", wx * 120, wy * 120))
+                if dx or dy:
+                    self.guest_move(dx, dy)
             elif dx or dy:
                 self.local_move(dx, dy)
 
@@ -682,7 +710,7 @@ class GuestInput(threading.Thread):
             self.d.send(14, struct.pack("<ii", rx, ry))
 
 PTR_MIN_INTERVAL = 0.008   # Pointer absoluto enviado no maximo a ~120 Hz
-REL_MIN_INTERVAL = 0.002   # PointerRel enviado no maximo a ~500 Hz
+REL_MIN_INTERVAL = 0.001   # PointerRel enviado no maximo a ~1000 Hz
 
 
 # ------------------------------------------------------------------ daemon --

@@ -262,6 +262,8 @@ No Linux, `~/.config/desklink/config.json` (opcional):
 
 > Suavidade (v0.2.3): o daemon envia deltas (`PointerRel`, msg 14) somados e coalescidos (até ~500 Hz, `TCP_NODELAY`) e escala o movimento pela razão entre as telas. Se o cursor no Windows estiver rápido ou lento demais, ajuste `GuestSpeed` (ex.: `0.8` ou `1.3`).
 
+> Wayland/grab (v0.2.5): em alguns compositores o `EVIOCGRAB` falha com `EINVAL` (visto em mouse com fio). O daemon registra a falha uma vez, não insiste e passa a encaminhar mouse e teclado ao Windows mesmo sem captura; nesse caso o cursor do Linux também se mexe. O daemon lê no máximo 1 mouse (primeiro `eventN`) e 1 teclado (prefere nome Logitech/USB, senão o menor `eventN`). Na entrada, o daemon envia a posição absoluta inicial (msg 3) e o Windows só detecta saída por overflow depois do primeiro posicionamento.
+
 Depois de editar: `Stop-ScheduledTask DeskLink; Start-ScheduledTask DeskLink`.
 
 **Logs**
