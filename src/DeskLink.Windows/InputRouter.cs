@@ -530,7 +530,7 @@ internal sealed class InputRouter
             foreach (var code in _inKeys.ToArray())
                 if (KeyMap.TryEvdevToScan(code, out ushort scan, out bool ext)) SendKey(scan, ext, false);
             _inKeys.Clear();
-            foreach (var btn in _inButtons.ToArray()) InboundButton(btn, false);
+            foreach (var btn in _inButtons.ToArray()) InboundButton((byte)btn, false);
             _inButtons.Clear();
 
             if (notifyServer && _link.IsConnected)
