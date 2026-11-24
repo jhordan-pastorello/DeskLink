@@ -37,8 +37,8 @@ internal sealed class InputRouter
     private string _inboundEdge = "top";   // borda de saida do Windows (oposta a do Linux)
     private int _ix;
     private int _iy;
-    private int _vx;   // posicao virtual do Linux (pode passar da borda de saida)
-    private int _vy;
+    private int _ivx;  // posicao virtual inbound (pode passar da borda de saida)
+    private int _ivy;
     private int _inOverflow;
     private readonly HashSet<int> _inKeys = new();
     private readonly HashSet<int> _inButtons = new();
@@ -477,8 +477,8 @@ internal sealed class InputRouter
     private void SyncVirtual(int x, int y, int w, int h)
     {
         int m = InboundExitOverflow;
-        _vx = Math.Clamp(x, _inboundEdge == "left" ? -m : 0, w - 1 + (_inboundEdge == "right" ? m : 0));
-        _vy = Math.Clamp(y, _inboundEdge == "top" ? -m : 0, h - 1 + (_inboundEdge == "bottom" ? m : 0));
+        _ivx = Math.Clamp(x, _inboundEdge == "left" ? -m : 0, w - 1 + (_inboundEdge == "right" ? m : 0));
+        _ivy = Math.Clamp(y, _inboundEdge == "top" ? -m : 0, h - 1 + (_inboundEdge == "bottom" ? m : 0));
     }
 
     // Sob _inLock: aplica o delta (pixels) na posicao virtual, trata o exit por overflow
@@ -488,7 +488,7 @@ internal sealed class InputRouter
         ax = ay = 0;
         int w = Math.Max(2, _screenW);
         int h = Math.Max(2, _screenH);
-        long nx = (long)_vx + dx, ny = (long)_vy + dy;
+        long nx = (long)_ivx + dx, ny = (long)_ivy + dy;
         int x = (int)Math.Clamp(nx, -10000, 10000), y = (int)Math.Clamp(ny, -10000, 10000);
         int oldX = _ix, oldY = _iy;
         if (!InboundPointer(x, y, out int px, out int py)) return;
