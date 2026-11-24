@@ -300,6 +300,8 @@ internal sealed class InputRouter
         {
             if (!_link.IsConnected) return;
 
+            bool move = false;
+            int mx = 0, my = 0;
             lock (_inLock)
             {
                 if (type == Proto.Hosting)
@@ -319,7 +321,7 @@ internal sealed class InputRouter
                         break;
 
                     case Proto.Pointer when payload.Length >= 8:
-                        InboundPointer(BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4));
+                        move = InboundPointer(BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4), out mx, out my);
                         break;
 
                     case Proto.Button when payload.Length >= 2:
@@ -335,6 +337,9 @@ internal sealed class InputRouter
                         break;
                 }
             }
+
+            // movimento fora do lock: so a posicao mais recente importa
+            if (move) Native.SetCursorPos(mx, my);
         }
         catch (Exception ex)
         {
@@ -422,8 +427,10 @@ internal sealed class InputRouter
         Log.Write($"Linux assumiu o controle (saida pela borda {exitEdge})");
     }
 
-    private void InboundPointer(int x, int y)
+    // Sob _inLock: so atualiza estado. Devolve true com a posicao a aplicar (fora do lock).
+    private bool InboundPointer(int x, int y, out int px, out int py)
     {
+        px = py = 0;
         int w = Math.Max(2, _screenW);
         int h = Math.Max(2, _screenH);
 
@@ -441,7 +448,7 @@ internal sealed class InputRouter
             if (over >= InboundExitOverflow)
             {
                 ExitInbound(notifyServer: true, "empurrou alem da borda");
-                return;
+                return false;
             }
         }
         else
@@ -451,17 +458,9 @@ internal sealed class InputRouter
 
         _ix = Math.Clamp(x, 0, w - 1);
         _iy = Math.Clamp(y, 0, h - 1);
-        // absoluto normalizado 0..65535 sobre a tela primaria
-        int nx = (int)((long)_ix * 65535 / (w - 1));
-        int ny = (int)((long)_iy * 65535 / (h - 1));
-        var i = new Native.INPUT { type = Native.INPUT_MOUSE };
-        i.mi = new Native.MOUSEINPUT
-        {
-            dx = nx,
-            dy = ny,
-            dwFlags = Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE
-        };
-        Send(i);
+        px = _ix;
+        py = _iy;
+        return true;
     }
 
     private static void Send(Native.INPUT input)

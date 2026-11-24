@@ -260,6 +260,8 @@ No Linux, `~/.config/desklink/config.json` (opcional):
 | `GuestSwitchDelayMs` | `250` | Tempo empurrando contra a borda antes de trocar |
 | `GuestSpeed` | `1.0` | Multiplicador do movimento do mouse no Windows |
 
+> Suavidade (v0.2.2): o daemon coalesce os movimentos do mouse (último vence, até ~120 Hz) e escala o movimento pela razão entre as telas. Se o cursor no Windows estiver rápido ou lento demais, ajuste `GuestSpeed` (ex.: `0.8` ou `1.3`).
+
 Depois de editar: `Stop-ScheduledTask DeskLink; Start-ScheduledTask DeskLink`.
 
 **Logs**

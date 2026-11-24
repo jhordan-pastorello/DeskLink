@@ -662,8 +662,11 @@ class GuestInput(threading.Thread):
     def guest_move(self, dx, dy):
         cw, ch = self.d.client_w, self.d.client_h
         opp = OPPOSITE[self.edge]
-        nx = self.gx + dx * self.speed
-        ny = self.gy + dy * self.speed
+        # mesma escala do sentido Windows->Linux (OnRawMove): tela do Linux -> tela do Windows
+        sx = cw / max(1, self.d.remote_w) * self.speed
+        sy = ch / max(1, self.d.remote_h) * self.speed
+        nx = self.gx + dx * sx
+        ny = self.gy + dy * sy
         xlo = -GUEST_OVERSHOOT if opp == "left" else 0
         xhi = cw - 1 + (GUEST_OVERSHOOT if opp == "right" else 0)
         ylo = -GUEST_OVERSHOOT if opp == "top" else 0
@@ -671,6 +674,8 @@ class GuestInput(threading.Thread):
         self.gx = max(xlo, min(xhi, nx))
         self.gy = max(ylo, min(yhi, ny))
         self.d.send(3, struct.pack("<ii", int(self.gx), int(self.gy)))
+
+PTR_MIN_INTERVAL = 0.008   # Pointer enviado no maximo a ~120 Hz
 
 
 # ------------------------------------------------------------------ daemon --
@@ -685,6 +690,10 @@ class Daemon:
         self.last_clip_key = None
         self._send_lock = threading.Lock()
         self._txq = queue.Queue(maxsize=4096)
+        self._ptr_lock = threading.Lock()
+        self._ptr_pending = None      # (conn, x, y): so a ultima posicao importa
+        self._ptr_queued = False      # ja existe marcador de Pointer na fila
+        self._ptr_last = 0.0
         threading.Thread(target=self._writer_loop, daemon=True, name="writer").start()
         self.remote_w, self.remote_h = detect_screen()
         save_json(SCREEN_FILE, w=self.remote_w, h=self.remote_h)
@@ -755,6 +764,20 @@ class Daemon:
         conn = self.conn
         if conn is None:
             return
+        if msg_type == 3 and len(payload) == 8:
+            # coalescencia "latest wins": no maximo um marcador de Pointer na fila
+            x, y = struct.unpack("<ii", payload)
+            with self._ptr_lock:
+                self._ptr_pending = (conn, x, y)
+                if self._ptr_queued:
+                    return
+                self._ptr_queued = True
+            try:
+                self._txq.put_nowait((conn, None))
+            except queue.Full:
+                with self._ptr_lock:
+                    self._ptr_queued = False
+            return
         frame = struct.pack("<BI", msg_type, len(payload)) + payload
         item = (conn, frame)   # amarrado a conexao: nao vaza para a proxima
         try:
@@ -769,6 +792,21 @@ class Daemon:
     def _writer_loop(self):
         while True:
             conn, frame = self._txq.get()
+            if frame is None:
+                # marcador de Pointer: limita a ~120 Hz e envia so a posicao mais recente
+                wait = PTR_MIN_INTERVAL - (time.monotonic() - self._ptr_last)
+                if wait > 0:
+                    time.sleep(wait)
+                with self._ptr_lock:
+                    pend = self._ptr_pending
+                    self._ptr_pending = None
+                    self._ptr_queued = False
+                if pend is None:
+                    continue
+                conn, x, y = pend
+                payload = struct.pack("<ii", x, y)
+                frame = struct.pack("<BI", 3, len(payload)) + payload
+                self._ptr_last = time.monotonic()
             if conn is None or conn is not self.conn:
                 continue      # conexao mudou/caiu: descarta
             try:
@@ -789,6 +827,9 @@ class Daemon:
             pass
 
     def _clear_txq(self):
+        with self._ptr_lock:
+            self._ptr_pending = None
+            self._ptr_queued = False
         try:
             while True:
                 self._txq.get_nowait()
