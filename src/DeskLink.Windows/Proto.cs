@@ -5,7 +5,7 @@ namespace DeskLink;
 
 internal static class Proto
 {
-    public const byte Hello = 1, HelloAck = 2, Pointer = 3, Button = 4, Wheel = 5, Key = 6, Leave = 7, Heartbeat = 8, Clipboard = 9, ClipboardImage = 10, PullClipboard = 11;
+    public const byte Hello = 1, HelloAck = 2, Pointer = 3, Button = 4, Wheel = 5, Key = 6, Leave = 7, Heartbeat = 8, Clipboard = 9, ClipboardImage = 10, PullClipboard = 11, Hosting = 12, HostingAck = 13;
 
     private static byte[] Frame(byte type, int len)
     {
@@ -49,6 +49,24 @@ internal static class Proto
 
     public static byte[] LeaveMsg() => Frame(Leave, 0);
 
+    /// <summary>Leave com epoch da sessao inbound (o Linux ignora Leave de epoch antigo).</summary>
+    public static byte[] LeaveMsg(int epoch)
+    {
+        var json = JsonSerializer.SerializeToUtf8Bytes(new { epoch });
+        var b = Frame(Leave, json.Length);
+        json.CopyTo(b, 5);
+        return b;
+    }
+
+    /// <summary>Confirma o Hosting (12): so depois disso o Linux captura o teclado/mouse fisicos.</summary>
+    public static byte[] HostingAckMsg(int epoch)
+    {
+        var json = JsonSerializer.SerializeToUtf8Bytes(new { epoch });
+        var b = Frame(HostingAck, json.Length);
+        json.CopyTo(b, 5);
+        return b;
+    }
+
     public static byte[] ClipboardMsg(string text)
     {
         var data = System.Text.Encoding.UTF8.GetBytes(text);
@@ -70,9 +88,10 @@ internal static class Proto
 
     public static byte[] PullClipboardMsg() => Frame(PullClipboard, 0);
 
-    public static byte[] HelloMsg(string name, int w, int h)
+    public static byte[] HelloMsg(string name, int w, int h, bool inbound)
     {
-        var json = JsonSerializer.SerializeToUtf8Bytes(new { v = 1, name, w, h });
+        var caps = inbound ? new[] { "inbound" } : Array.Empty<string>();
+        var json = JsonSerializer.SerializeToUtf8Bytes(new { v = 2, name, w, h, caps });
         var b = Frame(Hello, json.Length);
         json.CopyTo(b, 5);
         return b;

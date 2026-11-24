@@ -23,6 +23,7 @@ internal sealed class LinkClient
     private volatile int _remoteH = 1440;
     private TcpClient? _tcp;
     private SslStream? _ssl;
+    private Exception? _fault;
 
     public LinkClient(Config cfg) => _cfg = cfg;
 
@@ -31,6 +32,12 @@ internal sealed class LinkClient
     public int RemoteHeight => _remoteH;
 
     public event Action<byte, byte[]>? OnFrame;
+
+    /// <summary>Entrada vinda do servidor (msgs 3-7 e 12): KVM bidirecional.</summary>
+    public event Action<byte, byte[]>? OnInput;
+
+    /// <summary>Conexao perdida (para soltar teclas/botoes injetados).</summary>
+    public event Action? OnDisconnected;
 
     public void Send(byte[] frame)
     {
@@ -48,11 +55,13 @@ internal sealed class LinkClient
     {
         while (true)
         {
+            bool wasConnected = false;
             try
             {
                 var (host, port) = Discover();
                 Connect(host, port);
                 _connected = true;
+                wasConnected = true;
                 Log.Write($"conectado a {host}:{port} (remoto {_remoteW}x{_remoteH})");
                 Pump();
             }
@@ -61,9 +70,13 @@ internal sealed class LinkClient
                 Log.Write("link: " + ex.Message);
             }
 
-            if (_connected) Log.Write("desconectado");
+            if (wasConnected) Log.Write("desconectado");
             _connected = false;
             Drain();
+            if (wasConnected)
+            {
+                try { OnDisconnected?.Invoke(); } catch (Exception ex) { Log.Write("OnDisconnected: " + ex.Message); }
+            }
 
             try { _ssl?.Dispose(); } catch { }
             try { _tcp?.Dispose(); } catch { }
@@ -140,7 +153,7 @@ internal sealed class LinkClient
 
         var sw = Native.GetSystemMetrics(Native.SM_CXSCREEN);
         var sh = Native.GetSystemMetrics(Native.SM_CYSCREEN);
-        Write(Proto.HelloMsg(Environment.MachineName, sw, sh));
+        Write(Proto.HelloMsg(Environment.MachineName, sw, sh, _cfg.InboundEnabled && _cfg.Enabled));
 
         var (type, payload) = ReadFrame(_ssl);
         if (type != Proto.HelloAck)
@@ -171,30 +184,65 @@ internal sealed class LinkClient
         return true;
     }
 
+    private static bool IsInputFrame(byte type) =>
+        type is Proto.Pointer or Proto.Button or Proto.Wheel or Proto.Key or Proto.Leave or Proto.Hosting;
+
     private void Pump()
     {
-        var lastBeat = DateTime.UtcNow;
-        while (true)
+        // Leitura em thread propria: o loop de escrita bloqueia ate 30 ms em
+        // TryTake, o que limitaria a ~33 msgs/s a entrada vinda do servidor.
+        // SslStream aceita uma leitura e uma escrita simultaneas.
+        var ssl = _ssl!;
+        Volatile.Write(ref _fault, null);
+        _tcp!.ReceiveTimeout = 0;
+        var reader = new Thread(() =>
         {
-            if (_queue.TryTake(out var frame, 30))
-                Write(frame);
-
-            if ((DateTime.UtcNow - lastBeat).TotalSeconds >= 5)
+            try
             {
-                Write(Proto.HeartbeatMsg());
-                lastBeat = DateTime.UtcNow;
+                while (true)
+                {
+                    var (type, payload) = ReadFrame(ssl);
+                    if (type == Proto.Clipboard || type == Proto.ClipboardImage)
+                        OnFrame?.Invoke(type, payload);
+                    else if (IsInputFrame(type))
+                        OnInput?.Invoke(type, payload);
+                }
             }
-
-            var sock = _tcp!.Client;
-            if (sock.Poll(0, SelectMode.SelectRead))
+            catch (Exception ex)
             {
-                if (sock.Available == 0)
-                    throw new IOException("servidor encerrou a conexao");
-
-                var (type, payload) = ReadFrame(_ssl!);
-                if (type == Proto.Clipboard || type == Proto.ClipboardImage)
-                    OnFrame?.Invoke(type, payload);
+                Volatile.Write(ref _fault, ex);
             }
+        }) { IsBackground = true, Name = "desklink-read" };
+        reader.Start();
+
+        try
+        {
+            var lastBeat = DateTime.UtcNow;
+            while (true)
+            {
+                if (_queue.TryTake(out var frame, 30))
+                    Write(frame);
+
+                if ((DateTime.UtcNow - lastBeat).TotalSeconds >= 5)
+                {
+                    Write(Proto.HeartbeatMsg());
+                    lastBeat = DateTime.UtcNow;
+                }
+
+                var fault = Volatile.Read(ref _fault);
+                if (fault != null)
+                    throw new IOException("servidor encerrou a conexao: " + fault.Message);
+            }
+        }
+        finally
+        {
+            // Fecha o socket para destravar o leitor e espera ele terminar:
+            // OnDisconnected so dispara depois, sem callbacks de entrada em voo.
+            _connected = false;
+            try { _ssl?.Dispose(); } catch { }
+            try { _tcp?.Dispose(); } catch { }
+            if (!reader.Join(3000))
+                Log.Write("leitor nao terminou em 3s");
         }
     }
 

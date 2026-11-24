@@ -171,6 +171,36 @@ e anexa tudo, com `SHA256SUMS.txt`, à release.
 Ao trocar, o cursor do Windows "desaparece" (fica numa janela invisível) e o teclado passa a
 digitar no Linux — inclusive acentos, `Ctrl+C/V`, `Alt+Tab` e atalhos do desktop.
 
+### Uso bidirecional (Linux → Windows)
+
+O mesmo link também funciona ao contrário: o **teclado e mouse físicos do Linux** passam a
+controlar o Windows. Pelo daemon, que lê os dispositivos físicos via evdev (sem dependências
+extras) e captura (`EVIOCGRAB`) só enquanto controla o Windows.
+
+> **Opt-in:** o sentido Linux → Windows vem **desligado**. Para ativar, ponha
+> `"InboundEnabled": true` no `config.json` do Windows (e reinicie a tarefa). Sem isso o
+> Windows não anuncia a capacidade `inbound` no `Hello`, o daemon nunca captura o teclado/mouse
+> do Linux e recusa a sessão. Mesmo ligado, o daemon só captura **depois do `HostingAck`**
+> (msg 13) do Windows; sem ack em 500 ms a sessão é cancelada e nada é capturado.
+
+| Ação | Como |
+|---|---|
+| Ir para o Windows | empurre o mouse contra a **borda inferior** do Linux (~60 unidades além da borda, por `GuestSwitchDelayMs`) |
+| Voltar para o Linux | suba até a **borda superior** do Windows e **empurre ~40 px** além dela |
+| Voltar a qualquer momento | `Ctrl+Alt+Espaço` (no teclado físico do Linux, ou no Windows) |
+| Desligar | `"GuestEnabled": false` no `~/.config/desklink/config.json` do Linux (reinicie o daemon) ou deixe `InboundEnabled` em `false` (padrão) no Windows |
+
+- Os dois sentidos são **mutuamente exclusivos**: com o Windows controlando o Linux, o daemon
+  pausa a leitura física; com o Linux controlando o Windows, a borda do Windows não troca.
+- Exige acesso de leitura a `/dev/input/event*` (grupo `input`, o mesmo do uinput).
+- O Wayland não expõe a posição do cursor, então o daemon a **estima** pelos deltas do mouse.
+  Se a estimativa estiver errada logo após iniciar, empurre contra a borda uma vez para
+  recalibrar.
+- Teclas e botões presos são soltos ao voltar, e a captura só é feita/liberada com tudo solto.
+- Segurança: se o link ficar mudo por mais de 10 s durante o controle, o daemon libera a captura
+  sozinho (watchdog). A captura é liberada antes de enviar o `Leave`.
+- O fluxo Windows → Linux (borda superior do notebook) continua igual.
+
 A margem de 40 px na volta existe de propósito: encostar na borda durante um arrasto não corta
 mais a seleção; para voltar é preciso empurrar o ponteiro para fora.
 
@@ -219,6 +249,16 @@ abra o app, arraste o arquivo e o outro lado aceita o pareamento.
 | `DiscoveryPort` | `47811` | Porta UDP de descoberta |
 | `ToggleHotkeyEnabled` | `true` | Habilita `Ctrl+Alt+Espaço` |
 | `ServerFingerprint` | `""` | Preenchido sozinho no primeiro contato (TOFU) |
+| `InboundEnabled` | `false` | Opt-in: aceita o Linux controlando este Windows (KVM bidirecional). Sem `true`, o Linux nunca captura o teclado/mouse |
+
+No Linux, `~/.config/desklink/config.json` (opcional):
+
+| Campo | Padrão | Descrição |
+|---|---|---|
+| `GuestEnabled` | `true` | Liga/desliga o controle do Windows pelo teclado/mouse do Linux |
+| `GuestEdge` | `bottom` | Borda do Linux que leva ao Windows: `top`, `bottom`, `left`, `right` |
+| `GuestSwitchDelayMs` | `250` | Tempo empurrando contra a borda antes de trocar |
+| `GuestSpeed` | `1.0` | Multiplicador do movimento do mouse no Windows |
 
 Depois de editar: `Stop-ScheduledTask DeskLink; Start-ScheduledTask DeskLink`.
 
@@ -234,17 +274,24 @@ Cada mensagem: `[u8 tipo][u32 tamanho LE][payload]`.
 
 | Tipo | Nome | Payload | Direção |
 |---:|---|---|---|
-| 1 | `Hello` | JSON `{v,name,w,h}` | W → L |
+| 1 | `Hello` | JSON `{v,name,w,h,caps}`; `v=2`, `caps:["inbound"]` só se `InboundEnabled` e `Enabled` | W → L |
 | 2 | `HelloAck` | JSON `{v,name,w,h}` | L → W |
 | 3 | `Pointer` | `i32 x, i32 y` (absoluto, espaço do servidor) | W → L |
 | 4 | `Button` | `u8 botão (1=esq,2=meio,3=dir,4=extra), u8 down` | W → L |
 | 5 | `Wheel` | `i32 dx, i32 dy` (unidades de 120, igual evdev) | W → L |
 | 6 | `Key` | `u16 keycode evdev, u8 down` | W → L |
-| 7 | `Leave` | — (libera teclas/botões) | W → L |
+| 7 | `Leave` | — (libera teclas/botões); em modo guest, JSON `{epoch}` (descartado se for de sessão antiga) devolve o controle, ou recusa um `Hosting` | ambos |
 | 8 | `Heartbeat` | — | W → L |
 | 9 | `Clipboard` | UTF-8 | ambos |
 | 10 | `ClipboardImage` | PNG | ambos |
 | 11 | `PullClipboard` | — (pede o clipboard do Linux) | W → L |
+| 12 | `Hosting` | JSON `{edge,w,h,epoch}`: o Linux pede para assumir o Windows (KVM bidirecional) | L → W |
+| 13 | `HostingAck` | JSON `{epoch}`: o Windows aceitou; só então o Linux captura (`EVIOCGRAB`) | W → L |
+
+No modo guest (veja *Uso bidirecional*), as mensagens 3–6 também seguem **L → W**:
+O Windows só trata 3–6 dentro de uma sessão iniciada por `Hosting` (12) e aceita (13); fora dela descarta.
+`Pointer` em **pixels do Windows** (pode sair da tela até 100 px na borda de saída, para
+o Windows medir o empurrão), `Key` com keycodes evdev. O Windows injeta com `SendInput`.
 
 Handshake:
 

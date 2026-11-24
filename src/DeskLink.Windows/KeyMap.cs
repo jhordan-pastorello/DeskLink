@@ -27,6 +27,8 @@ internal static class KeyMap
         [0x51] = 81, [0x52] = 82, [0x53] = 83,
         [0x56] = 86,                                                      // 102nd (tecla <> ABNT2)
         [0x57] = 87, [0x58] = 88,                                         // f11 f12
+        [0x73] = 89,                                                      // RO (tecla / ? ABNT2)
+        [0x7E] = 121,                                                     // KPCOMMA (ABNT2)
     };
 
     private static readonly Dictionary<int, int> ExtMap = new()
@@ -36,6 +38,7 @@ internal static class KeyMap
         [0x35] = 98,   // kp /
         [0x37] = 99,   // print screen
         [0x38] = 100,  // ralt
+        [0x45] = 69,   // numlock (estendida; sem o flag o Windows entende Pause)
         [0x47] = 102, [0x48] = 103, [0x49] = 104,   // home up pgup
         [0x4B] = 105, [0x4D] = 106,                  // left right
         [0x4F] = 107, [0x50] = 108, [0x51] = 109,   // end down pgdn
@@ -43,6 +46,32 @@ internal static class KeyMap
         [0x5B] = 125, [0x5C] = 126, [0x5D] = 127,   // lmeta rmeta compose
         [0x5E] = 127,
     };
+
+    // evdev -> (scan code set 1, extendida). Em duplicatas (127) vale a primeira.
+    private static readonly Dictionary<int, (ushort scan, bool ext)> Inverse = BuildInverse();
+
+    private static Dictionary<int, (ushort, bool)> BuildInverse()
+    {
+        var inv = new Dictionary<int, (ushort, bool)>();
+        foreach (var kv in Map) inv.TryAdd(kv.Value, ((ushort)kv.Key, false));
+        foreach (var kv in ExtMap) inv.TryAdd(kv.Value, ((ushort)kv.Key, true));
+        inv[69] = (0x45, true);   // NumLock precisa do flag estendido no SendInput
+        return inv;
+    }
+
+    /// <summary>Inverso de <see cref="TryMap"/>: evdev -> scan code para SendInput.</summary>
+    public static bool TryEvdevToScan(int evdev, out ushort scan, out bool extended)
+    {
+        if (Inverse.TryGetValue(evdev, out var v))
+        {
+            scan = v.scan;
+            extended = v.ext;
+            return true;
+        }
+        scan = 0;
+        extended = false;
+        return false;
+    }
 
     public static bool TryMap(uint scanCode, bool extended, out int evdev)
     {

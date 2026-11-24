@@ -18,6 +18,9 @@ public sealed class Config
     /// <summary>Borda que leva ao Linux: top, bottom, left ou right.</summary>
     public string Edge { get; set; } = "top";
 
+    /// <summary>Aceita o teclado/mouse do Linux controlando este Windows (KVM bidirecional). Opt-in: desligado por padrao.</summary>
+    public bool InboundEnabled { get; set; } = false;
+
     [JsonIgnore]
     public static string Dir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskLink");

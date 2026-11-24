@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text.Json;
 
 namespace DeskLink;
 
@@ -19,13 +20,27 @@ internal sealed class InputRouter
     private const int ParkX = 8;
     private const int ParkY = 8;
 
-    private bool _remote;
+    // _remote/_inbound: leitura sem lock nos hooks (volatile); transicoes sob _inLock.
+    private volatile bool _remote;
     private bool _armed = true;
     private int _vx;
     private int _vy;
     private DateTime _edgeSince = DateTime.MinValue;
     private int _overflow;
     private readonly HashSet<int> _keysDown = new();
+
+    // ---- KVM bidirecional: o Linux controla este Windows ----
+    // _inLock e o lock de estado (_remote/_inbound). Nunca bloquear nele dentro de hook: use TryEnter.
+    private readonly object _inLock = new();
+    private volatile bool _inbound;
+    private int _inboundEpoch;
+    private string _inboundEdge = "top";   // borda de saida do Windows (oposta a do Linux)
+    private int _ix;
+    private int _iy;
+    private int _inOverflow;
+    private readonly HashSet<int> _inKeys = new();
+    private readonly HashSet<int> _inButtons = new();
+    private const int InboundExitOverflow = 40;
 
     public InputRouter(Config cfg, LinkClient link)
     {
@@ -59,7 +74,7 @@ internal sealed class InputRouter
             if (nCode >= 0)
             {
                 var info = Marshal.PtrToStructure<Native.MSLLHOOKSTRUCT>(lParam);
-                if (HandleMouse((int)wParam, info.pt, info.mouseData))
+                if (HandleMouse((int)wParam, info.pt, info.mouseData, info.flags))
                     return (IntPtr)1;
             }
         }
@@ -89,8 +104,12 @@ internal sealed class InputRouter
     }
 
     // ------------------------------------------------------------- mouse ----
-    private bool HandleMouse(int msg, Native.POINT pt, int data)
+    private bool HandleMouse(int msg, Native.POINT pt, int data, uint flags)
     {
+        // eventos que nos mesmos injetamos (Linux -> Windows) passam direto
+        if (_inbound && (flags & Native.LLMHF_INJECTED) != 0)
+            return false;
+
         if (!_cfg.Enabled || !_link.IsConnected)
         {
             if (_remote) ExitRemote();
@@ -132,6 +151,13 @@ internal sealed class InputRouter
     {
         if (!_remote)
         {
+            // Linux esta controlando este Windows: nao disputa o controle
+            if (_inbound)
+            {
+                _edgeSince = DateTime.MinValue;
+                return false;
+            }
+
             if (OnEdge(pt))
             {
                 if (!_armed) return false;
@@ -221,11 +247,17 @@ internal sealed class InputRouter
     {
         bool down = msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN;
 
+        // teclas injetadas por nos (Linux -> Windows) nao disparam atalho nem roteamento
+        if (_inbound && (k.flags & Native.LLKHF_INJECTED) != 0)
+            return false;
+
         if (_cfg.ToggleHotkeyEnabled && k.vkCode == 0x20 && CtrlAltDown())
         {
             if (down)
             {
-                if (_remote) ExitRemote();
+                // SendInput (soltar teclas) dentro do hook sob lock pode travar: adia para o pool
+                if (_inbound) ThreadPool.QueueUserWorkItem(_ => ExitInbound(notifyServer: true, "atalho"));
+                else if (_remote) ExitRemote();
                 else if (_link.IsConnected) EnterRemote(new Native.POINT { X = _screenW / 2, Y = _screenH / 2 });
             }
             return true;
@@ -258,10 +290,285 @@ internal sealed class InputRouter
     private static bool CtrlAltDown() =>
         (Native.GetAsyncKeyState(0x11) & 0x8000) != 0 && (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
 
+    // ------------------------------------------------ entrada do Linux -------
+    // Chamado na thread de leitura do LinkClient. Msgs: 12 Hosting (Linux assumiu),
+    // 3 Pointer (absoluto em pixels do Windows, pode sair da tela na borda de
+    // saida), 4 Button, 5 Wheel, 6 Key (evdev), 7 Leave (Linux devolveu o controle).
+    public void OnInbound(byte type, byte[] payload)
+    {
+        try
+        {
+            if (!_link.IsConnected) return;
+
+            lock (_inLock)
+            {
+                if (type == Proto.Hosting)
+                {
+                    HandleHosting(payload);
+                    return;
+                }
+
+                // 3-6 so valem dentro de uma sessao aceita (Hosting + ack); frames
+                // atrasados de uma sessao encerrada sao descartados.
+                if (!_inbound) return;
+
+                switch (type)
+                {
+                    case Proto.Leave:
+                        if (EpochMatches(payload)) ExitInbound(notifyServer: false, "servidor devolveu");
+                        break;
+
+                    case Proto.Pointer when payload.Length >= 8:
+                        InboundPointer(BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4));
+                        break;
+
+                    case Proto.Button when payload.Length >= 2:
+                        InboundButton(payload[0], payload[1] != 0);
+                        break;
+
+                    case Proto.Wheel when payload.Length >= 8:
+                        InboundWheel(BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4));
+                        break;
+
+                    case Proto.Key when payload.Length >= 3:
+                        InboundKey(BitConverter.ToUInt16(payload, 0), payload[2] != 0);
+                        break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write("entrada do servidor: " + ex);
+        }
+    }
+
+    // Hosting (12): so aqui uma sessao inbound comeca. Recusa com Leave se o
+    // inbound esta desligado ou o Windows esta controlando o Linux.
+    private void HandleHosting(byte[] payload)
+    {
+        var (edge, epoch) = ParseHosting(payload);
+        if (!_cfg.Enabled || !_cfg.InboundEnabled || _remote)
+        {
+            Log.Write("Hosting recusado (inbound desligado ou Windows controlando o Linux)");
+            _link.Send(Proto.LeaveMsg(epoch));
+            return;
+        }
+        EnterInbound(edge, epoch);
+        _link.Send(Proto.HostingAckMsg(epoch));
+    }
+
+    // Leave sem epoch (servidor antigo) vale; com epoch so vale o da sessao atual.
+    private bool EpochMatches(byte[] payload)
+    {
+        if (payload.Length == 0) return true;
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            if (doc.RootElement.TryGetProperty("epoch", out var e))
+                return e.TryGetInt32(out var v) && v == _inboundEpoch;
+        }
+        catch { }
+        return true;
+    }
+
+    public void OnLinkLost()
+    {
+        lock (_inLock)
+        {
+            if (_inbound) ExitInbound(notifyServer: false, "conexao perdida");
+        }
+    }
+
+    private static string OppositeEdge(string linuxEdge) => linuxEdge switch
+    {
+        "top" => "bottom",
+        "left" => "right",
+        "right" => "left",
+        _ => "top"
+    };
+
+    // payload: {"edge":"bottom","epoch":N} = borda do Linux por onde ele saiu e epoch da sessao
+    private static (string edge, int epoch) ParseHosting(byte[] payload)
+    {
+        string edge = "top";
+        int epoch = 0;
+        try
+        {
+            if (payload.Length > 0)
+            {
+                using var doc = JsonDocument.Parse(payload);
+                if (doc.RootElement.TryGetProperty("edge", out var e))
+                    edge = OppositeEdge((e.GetString() ?? "bottom").Trim().ToLowerInvariant());
+                if (doc.RootElement.TryGetProperty("epoch", out var ep) && ep.TryGetInt32(out var n))
+                    epoch = n;
+            }
+        }
+        catch { }
+        return (edge, epoch);
+    }
+
+    private void EnterInbound(string exitEdge, int epoch)
+    {
+        // exclusao mutua: se o Windows esta controlando o Linux, ignora
+        if (_remote) return;
+        if (_inbound) { _inboundEdge = exitEdge; _inboundEpoch = epoch; return; }
+        _inboundEdge = exitEdge;
+        _inboundEpoch = epoch;
+        _inbound = true;
+        _inOverflow = 0;
+        _inKeys.Clear();
+        _inButtons.Clear();
+        _edgeSince = DateTime.MinValue;
+        Log.Write($"Linux assumiu o controle (saida pela borda {exitEdge})");
+    }
+
+    private void InboundPointer(int x, int y)
+    {
+        int w = Math.Max(2, _screenW);
+        int h = Math.Max(2, _screenH);
+
+        int over = _inboundEdge switch
+        {
+            "bottom" => y - (h - 1),
+            "left" => -x,
+            "right" => x - (w - 1),
+            _ => -y
+        };
+
+        if (over > 0)
+        {
+            _inOverflow = over;
+            if (over >= InboundExitOverflow)
+            {
+                ExitInbound(notifyServer: true, "empurrou alem da borda");
+                return;
+            }
+        }
+        else
+        {
+            _inOverflow = 0;
+        }
+
+        _ix = Math.Clamp(x, 0, w - 1);
+        _iy = Math.Clamp(y, 0, h - 1);
+        // absoluto normalizado 0..65535 sobre a tela primaria
+        int nx = (int)((long)_ix * 65535 / (w - 1));
+        int ny = (int)((long)_iy * 65535 / (h - 1));
+        var i = new Native.INPUT { type = Native.INPUT_MOUSE };
+        i.mi = new Native.MOUSEINPUT
+        {
+            dx = nx,
+            dy = ny,
+            dwFlags = Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE
+        };
+        Send(i);
+    }
+
+    private static void Send(Native.INPUT input)
+    {
+        var arr = new[] { input };
+        if (Native.SendInput(1, arr, Marshal.SizeOf<Native.INPUT>()) == 0)
+            Log.Write("SendInput falhou: " + Marshal.GetLastWin32Error());
+    }
+
+    private static void SendMouse(uint flags, uint data = 0)
+    {
+        var i = new Native.INPUT { type = Native.INPUT_MOUSE };
+        i.mi = new Native.MOUSEINPUT { dwFlags = flags, mouseData = data };
+        Send(i);
+    }
+
+    private void InboundButton(byte btn, bool down)
+    {
+        uint flag; uint data = 0;
+        switch (btn)
+        {
+            case 1: flag = down ? Native.MOUSEEVENTF_LEFTDOWN : Native.MOUSEEVENTF_LEFTUP; break;
+            case 2: flag = down ? Native.MOUSEEVENTF_MIDDLEDOWN : Native.MOUSEEVENTF_MIDDLEUP; break;
+            case 3: flag = down ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_RIGHTUP; break;
+            case 4: flag = down ? Native.MOUSEEVENTF_XDOWN : Native.MOUSEEVENTF_XUP; data = 1; break;
+            case 5: flag = down ? Native.MOUSEEVENTF_XDOWN : Native.MOUSEEVENTF_XUP; data = 2; break;
+            default: return;
+        }
+        if (down) _inButtons.Add(btn); else _inButtons.Remove(btn);
+        SendMouse(flag, data);
+    }
+
+    private void InboundWheel(int dx, int dy)
+    {
+        if (dy != 0) SendMouse(Native.MOUSEEVENTF_WHEEL, unchecked((uint)dy));
+        if (dx != 0) SendMouse(Native.MOUSEEVENTF_HWHEEL, unchecked((uint)dx));
+    }
+
+    private void InboundKey(int evdev, bool down)
+    {
+        if (!KeyMap.TryEvdevToScan(evdev, out ushort scan, out bool ext)) return;
+        if (down) _inKeys.Add(evdev); else _inKeys.Remove(evdev);
+        SendKey(scan, ext, down);
+    }
+
+    private static void SendKey(ushort scan, bool ext, bool down)
+    {
+        uint flags = Native.KEYEVENTF_SCANCODE;
+        if (ext) flags |= Native.KEYEVENTF_EXTENDEDKEY;
+        if (!down) flags |= Native.KEYEVENTF_KEYUP;
+        var i = new Native.INPUT { type = Native.INPUT_KEYBOARD };
+        i.ki = new Native.KEYBDINPUT { wScan = scan, dwFlags = flags };
+        Send(i);
+    }
+
+    // Chamado dentro de _inLock (ou pelo hook, via atalho: pega o lock aqui).
+    private void ExitInbound(bool notifyServer, string reason)
+    {
+        lock (_inLock)
+        {
+            if (!_inbound) return;
+            _inbound = false;
+            _inOverflow = 0;
+
+            // solta tudo o que o Linux deixou pressionado
+            foreach (var code in _inKeys.ToArray())
+                if (KeyMap.TryEvdevToScan(code, out ushort scan, out bool ext)) SendKey(scan, ext, false);
+            _inKeys.Clear();
+            foreach (var btn in _inButtons.ToArray()) InboundButton(btn, false);
+            _inButtons.Clear();
+
+            if (notifyServer && _link.IsConnected)
+                _link.Send(Proto.LeaveMsg(_inboundEpoch));
+
+            // afasta o cursor da borda e desarma, senao a borda de entrada
+            // (topo) reenviaria o controle ao Linux na hora
+            if (reason != "conexao perdida")
+            {
+                int x = Math.Clamp(_ix, 0, _screenW - 1);
+                int y = Math.Clamp(_iy, 0, _screenH - 1);
+                (int x, int y) back = _inboundEdge switch
+                {
+                    "bottom" => (x, _screenH - 3),
+                    "left" => (2, y),
+                    "right" => (_screenW - 3, y),
+                    _ => (x, 3)
+                };
+                Native.SetCursorPos(back.x, back.y);
+            }
+            _armed = false;
+            _edgeSince = DateTime.MinValue;
+            Log.Write("Linux devolveu o controle: " + reason);
+        }
+    }
+
     // ------------------------------------------------------------ estado ----
     private void EnterRemote(Native.POINT at)
     {
-        if (!_link.IsConnected || _remote) return;
+        // chamado no hook: nunca bloqueia; se o lock esta ocupado tenta no proximo evento
+        if (!Monitor.TryEnter(_inLock)) return;
+        try { EnterRemoteLocked(at); }
+        finally { Monitor.Exit(_inLock); }
+    }
+
+    private void EnterRemoteLocked(Native.POINT at)
+    {
+        if (!_link.IsConnected || _remote || _inbound) return;
 
         int rw = Math.Max(1, _link.RemoteWidth);
         int rh = Math.Max(1, _link.RemoteHeight);
@@ -304,6 +611,14 @@ internal sealed class InputRouter
     }
 
     private void ExitRemote()
+    {
+        if (!_remote) return;
+        if (!Monitor.TryEnter(_inLock)) return;
+        try { ExitRemoteLocked(); }
+        finally { Monitor.Exit(_inLock); }
+    }
+
+    private void ExitRemoteLocked()
     {
         if (!_remote) return;
         _remote = false;

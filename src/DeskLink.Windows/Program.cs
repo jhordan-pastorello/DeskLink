@@ -41,6 +41,9 @@ internal static class Program
                 _clip.ApplyImage(payload);
         };
 
+        _link.OnInput += _router.OnInbound;
+        _link.OnDisconnected += _router.OnLinkLost;
+
         _link.Start();
         _router.Start();
         _clip.Start();

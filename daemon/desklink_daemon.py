@@ -13,8 +13,22 @@ Requisitos (uma vez):
 Protocolo: [u8 tipo][u32 tamanho LE][payload]
   1 Hello JSON | 2 HelloAck JSON | 3 Pointer i32,i32 | 4 Button u8,u8
   5 Wheel i32,i32 | 6 Key u16,u8 | 7 Leave | 8 Heartbeat | 9 Clipboard UTF-8
+  10 ClipboardImage PNG | 11 PullClipboard | 12 Hosting JSON {"edge","w","h","epoch"}
+  13 HostingAck JSON {"epoch"} (Windows -> Linux)
+
+KVM bidirecional (modo "guest"): o daemon tambem le o teclado/mouse FISICOS do
+Linux (evdev, sem dependencias) e, ao empurrar o ponteiro alem de GuestEdge,
+assume o Windows enviando 12 (Hosting). So depois do 13 (HostingAck, timeout
+500 ms) o daemon captura (EVIOCGRAB) e envia 3-6 com coordenadas em pixels do
+Windows; sem ack a sessao e cancelada e nada e capturado. Exige Hello v=2 com
+caps ["inbound"] (Windows com InboundEnabled). 7 (Leave, com epoch) do Windows
+devolve o controle; Ctrl+Alt+Espaco tambem.
+Config (~/.config/desklink/config.json): GuestEnabled (true), GuestEdge
+("bottom"), GuestSwitchDelayMs (250), GuestSpeed (1.0).
 """
+import errno
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -285,16 +299,393 @@ def read_clipboard():
     return None
 
 
+# ------------------------------------------------------- guest (evdev) -----
+
+EVIOCGRAB = 0x40044590
+EVIOCGNAME = 0x81004506          # _IOR('E', 0x06, char[256])
+KEY_A, KEY_ENTER, KEY_SPACE = 30, 28, 57
+KEY_CTRL = (29, 97)
+KEY_ALT = (56, 100)
+REL_WHEEL_CODE, REL_HWHEEL_CODE = REL_WHEEL, REL_HWHEEL
+BTN_REV = {v: k for k, v in BTN_MAP.items()}
+GUEST_PUSH_PX = 60       # empurrao minimo alem da borda (unidades brutas do mouse)
+GUEST_OVERSHOOT = 100    # quanto o ponteiro virtual pode passar da borda de saida
+UNGRAB_TIMEOUT = 2.0
+WRITE_TIMEOUT = 5.0
+ACK_TIMEOUT = 0.5        # espera pelo HostingAck antes de capturar
+GUEST_RX_WATCHDOG = 10.0  # sem nada do Windows por tanto tempo = devolve o controle
+OPPOSITE = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
+
+
+def _eviocgbit(ev, ln):
+    return 0x80000000 | (ln << 16) | 0x4500 | (0x20 + ev)
+
+
+def _bit(buf, n):
+    i = n >> 3
+    return i < len(buf) and bool(buf[i] >> (n & 7) & 1)
+
+
+class EvDev:
+    def __init__(self, path, fd, kind):
+        self.path = path
+        self.fd = fd
+        self.kind = kind          # "mouse" | "keyboard"
+        self.pressed = set()
+        self.grabbed = False
+        self.dx = self.dy = self.wx = self.wy = 0
+
+    def grab(self, on):
+        try:
+            fcntl.ioctl(self.fd, EVIOCGRAB, 1 if on else 0)
+            self.grabbed = on
+        except OSError as e:
+            log("EVIOCGRAB falhou em", self.path, e)
+            if not on:
+                self.grabbed = False
+
+    def close(self):
+        try:
+            os.close(self.fd)   # fechar o fd tambem solta o grab
+        except OSError:
+            pass
+
+
+def classify_evdev(path):
+    """Abre o device se for mouse/teclado fisico; senao devolve None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        name = bytearray(256)
+        fcntl.ioctl(fd, EVIOCGNAME, name)
+        name = bytes(name).split(b"\0", 1)[0].decode("utf-8", "replace")
+        if name.startswith("DeskLink"):
+            os.close(fd)
+            return None
+        types = bytearray(8)
+        fcntl.ioctl(fd, _eviocgbit(0, 8), types)
+        keys = bytearray(96)
+        if _bit(types, EV_KEY):
+            fcntl.ioctl(fd, _eviocgbit(EV_KEY, 96), keys)
+        rels = bytearray(8)
+        if _bit(types, EV_REL):
+            fcntl.ioctl(fd, _eviocgbit(EV_REL, 8), rels)
+        if _bit(rels, REL_X) and _bit(rels, REL_Y) and _bit(keys, BTN_LEFT):
+            return EvDev(path, fd, "mouse")
+        if _bit(keys, KEY_A) and _bit(keys, KEY_ENTER) and _bit(keys, KEY_SPACE):
+            return EvDev(path, fd, "keyboard")
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+class GuestInput(threading.Thread):
+    """Le mouse/teclado fisicos e, no modo guest, os encaminha ao Windows."""
+
+    def __init__(self, d, edge, delay_ms, speed):
+        super().__init__(name="guest", daemon=True)
+        self.d = d
+        self.edge = edge
+        self.delay = delay_ms / 1000.0
+        self.speed = speed
+        self.devs = {}            # path -> EvDev
+        self.guest = False
+        self.pending = False      # Hosting enviado, aguardando HostingAck
+        self.pending_deadline = 0.0
+        self.epoch = 0
+        self.armed = True
+        self.ungrab_deadline = 0.0
+        self.push = 0
+        self.push_since = None
+        self.est_x = d.remote_w // 2   # posicao estimada do cursor do Linux
+        self.est_y = d.remote_h // 2
+        self.gx = self.gy = 0.0        # ponteiro virtual, em pixels do Windows
+        self.lock = threading.RLock()
+
+    # ---- estado ----
+    def note_abs(self, x, y):
+        """Windows controlou o Linux: sabemos onde o cursor ficou."""
+        self.est_x, self.est_y = x, y
+
+    def _over(self, nx, ny):
+        w, h = self.d.remote_w, self.d.remote_h
+        if self.edge == "bottom":
+            return ny - (h - 1)
+        if self.edge == "left":
+            return -nx
+        if self.edge == "right":
+            return nx - (w - 1)
+        return -ny
+
+    def enter(self):
+        d = self.d
+        cw, ch = d.client_w, d.client_h
+        if d.conn is None or not cw or not ch or d.active or not d.inbound_cap:
+            return
+        w, h = d.remote_w, d.remote_h
+        fx = self.est_x / max(1, w - 1)
+        fy = self.est_y / max(1, h - 1)
+        if self.edge == "bottom":
+            self.gx, self.gy = fx * (cw - 1), 0
+        elif self.edge == "top":
+            self.gx, self.gy = fx * (cw - 1), ch - 1
+        elif self.edge == "left":
+            self.gx, self.gy = cw - 1, fy * (ch - 1)
+        else:
+            self.gx, self.gy = 0, fy * (ch - 1)
+        with self.lock:
+            if self.guest or self.pending:
+                return
+            self.epoch += 1
+            self.pending = True
+            self.pending_deadline = time.time() + ACK_TIMEOUT
+            self.push, self.push_since = 0, None
+            epoch = self.epoch
+        # nao captura nada ainda: so apos o HostingAck (on_ack)
+        d.send(12, json.dumps({"edge": self.edge, "w": w, "h": h, "epoch": epoch}).encode())
+        log("guest: Hosting enviado (epoch %d), aguardando ack" % epoch)
+
+    def on_ack(self, epoch):
+        """Windows aceitou: agora sim assume o controle (captura vem no apply_grab)."""
+        with self.lock:
+            if not self.pending or epoch != self.epoch:
+                return
+            self.pending = False
+            self.guest = True
+        self.d.send(3, struct.pack("<ii", int(self.gx), int(self.gy)))
+        log("guest: controlando o Windows (borda %s)" % self.edge)
+
+    def cancel_pending(self, reason, notify):
+        with self.lock:
+            if not self.pending:
+                return
+            self.pending = False
+            self.armed = False
+            epoch = self.epoch
+        if notify:
+            self.d.send(7, json.dumps({"epoch": epoch}).encode())
+        log("guest: sessao cancelada (%s)" % reason)
+
+    def on_remote_leave(self, epoch):
+        """Leave do Windows. Devolve True se pertencia a sessao guest (atual ou pendente)."""
+        with self.lock:
+            if epoch is not None and epoch != self.epoch:
+                return False          # Leave de sessao antiga
+            pending, guest = self.pending, self.guest
+        if pending:
+            self.cancel_pending("Windows recusou", False)
+            return True
+        if guest:
+            self.exit(False, "Windows devolveu o controle")
+            return True
+        return epoch is None
+
+    def exit(self, notify, reason):
+        with self.lock:
+            if not self.guest:
+                return
+            self.guest = False
+            self.armed = False
+            self.push, self.push_since = 0, None
+            self.ungrab_deadline = time.time() + UNGRAB_TIMEOUT
+            epoch = self.epoch
+            # libera a captura ANTES de avisar o Windows
+            for dev in list(self.devs.values()):
+                if dev.grabbed:
+                    dev.grab(False)
+        if notify:
+            self.d.send(7, json.dumps({"epoch": epoch}).encode())
+        # o cursor do Linux ficou parado na borda por onde saimos
+        w, h = self.d.remote_w, self.d.remote_h
+        if self.edge in ("bottom", "top"):
+            self.est_y = h - 1 if self.edge == "bottom" else 0
+        else:
+            self.est_x = w - 1 if self.edge == "right" else 0
+        log("guest: de volta ao Linux (%s)" % reason)
+
+    # ---- dispositivos ----
+    def scan(self):
+        for path in glob.glob("/dev/input/event*"):
+            if path in self.devs:
+                continue
+            dev = classify_evdev(path)
+            if dev:
+                with self.lock:
+                    self.devs[path] = dev
+                log("guest: lendo %s (%s)" % (path, dev.kind))
+
+    def drop(self, dev):
+        with self.lock:
+            self.devs.pop(dev.path, None)
+        dev.close()
+
+    def close_all(self):
+        for dev in list(self.devs.values()):
+            self.drop(dev)
+        with self.lock:
+            self.guest = False
+            self.pending = False
+
+    def apply_grab(self):
+        now = time.time()
+        for dev in list(self.devs.values()):
+            if self.guest:
+                # so captura com tudo solto: soltar tecla "no escuro" deixaria
+                # a tecla presa no compositor
+                if not dev.grabbed and not dev.pressed:
+                    dev.grab(True)
+            elif dev.grabbed and (not dev.pressed or now >= self.ungrab_deadline):
+                dev.grab(False)
+
+    # ---- loop ----
+    def run(self):
+        last_scan = 0.0
+        while True:
+            try:
+                d = self.d
+                if d.conn is None:
+                    if self.devs:
+                        self.close_all()
+                    time.sleep(0.5)
+                    continue
+                now = time.time()
+                if now - last_scan > 5.0:
+                    self.scan()
+                    last_scan = now
+                if self.guest and (d.active or d.conn is None):
+                    self.exit(False, "Windows assumiu o Linux")
+                if self.pending and (d.active or d.conn is None):
+                    self.cancel_pending("conexao/uso do Linux", False)
+                elif self.pending and now >= self.pending_deadline:
+                    # sem ack: nao captura; avisa o Windows para largar a sessao
+                    self.cancel_pending("timeout do HostingAck", True)
+                if self.guest and now - d.last_rx > GUEST_RX_WATCHDOG:
+                    self.exit(True, "watchdog: Windows sem resposta")
+                self.apply_grab()
+                if not self.devs:
+                    time.sleep(0.5)
+                    continue
+                by_fd = {dev.fd: dev for dev in list(self.devs.values())}
+                r, _, _ = select.select(list(by_fd), [], [], 0.1)
+                for fd in r:
+                    dev = by_fd[fd]
+                    try:
+                        data = os.read(fd, 24 * 64)
+                    except BlockingIOError:
+                        continue
+                    except OSError as e:
+                        if e.errno != errno.EAGAIN:
+                            self.drop(dev)
+                        continue
+                    if not data:
+                        self.drop(dev)
+                        continue
+                    for off in range(0, len(data) - 23, 24):
+                        _, _, et, code, val = struct.unpack_from("llHHi", data, off)
+                        self.on_event(dev, et, code, val)
+            except Exception as e:
+                log("guest: erro:", e)
+                time.sleep(0.5)
+
+    def _all_pressed(self):
+        s = set()
+        for dev in list(self.devs.values()):
+            s |= dev.pressed
+        return s
+
+    def on_event(self, dev, et, code, val):
+        d = self.d
+        if et == EV_KEY:
+            if val == 1:
+                dev.pressed.add(code)
+            elif val == 0:
+                dev.pressed.discard(code)
+            if not self.guest:
+                return
+            if val == 1 and code == KEY_SPACE:
+                p = self._all_pressed()
+                if any(k in p for k in KEY_CTRL) and any(k in p for k in KEY_ALT):
+                    self.exit(True, "Ctrl+Alt+Espaco")
+                    return
+            if not dev.grabbed:
+                return
+            if code in BTN_REV:
+                d.send(4, struct.pack("<BB", BTN_REV[code], 1 if val else 0))
+            elif code < 0x100:
+                # val 2 (repeticao) vira novo keydown: o Windows repete assim
+                d.send(6, struct.pack("<HB", code, 1 if val else 0))
+        elif et == EV_REL and dev.kind == "mouse":
+            if code == REL_X:
+                dev.dx += val
+            elif code == REL_Y:
+                dev.dy += val
+            elif code == REL_WHEEL_CODE:
+                dev.wy += val
+            elif code == REL_HWHEEL_CODE:
+                dev.wx += val
+        elif et == EV_SYN and code == SYN_REPORT and dev.kind == "mouse":
+            dx, dy, wx, wy = dev.dx, dev.dy, dev.wx, dev.wy
+            dev.dx = dev.dy = dev.wx = dev.wy = 0
+            if d.active:
+                return        # Windows controla o Linux: pausa
+            if self.guest:
+                if dev.grabbed:
+                    if wx or wy:
+                        d.send(5, struct.pack("<ii", wx * 120, wy * 120))
+                    if dx or dy:
+                        self.guest_move(dx, dy)
+            elif dx or dy:
+                self.local_move(dx, dy)
+
+    def local_move(self, dx, dy):
+        w, h = self.d.remote_w, self.d.remote_h
+        nx, ny = self.est_x + dx, self.est_y + dy
+        over = self._over(nx, ny)
+        self.est_x = max(0, min(w - 1, nx))
+        self.est_y = max(0, min(h - 1, ny))
+        now = time.time()
+        if over > 0:
+            if not self.armed:
+                return
+            self.push += over
+            if self.push_since is None:
+                self.push_since = now
+            if self.push >= GUEST_PUSH_PX and now - self.push_since >= self.delay:
+                self.enter()
+        elif over < 0:
+            self.push, self.push_since = 0, None
+            self.armed = True
+
+    def guest_move(self, dx, dy):
+        cw, ch = self.d.client_w, self.d.client_h
+        opp = OPPOSITE[self.edge]
+        nx = self.gx + dx * self.speed
+        ny = self.gy + dy * self.speed
+        xlo = -GUEST_OVERSHOOT if opp == "left" else 0
+        xhi = cw - 1 + (GUEST_OVERSHOOT if opp == "right" else 0)
+        ylo = -GUEST_OVERSHOOT if opp == "top" else 0
+        yhi = ch - 1 + (GUEST_OVERSHOOT if opp == "bottom" else 0)
+        self.gx = max(xlo, min(xhi, nx))
+        self.gy = max(ylo, min(yhi, ny))
+        self.d.send(3, struct.pack("<ii", int(self.gx), int(self.gy)))
+
+
 # ------------------------------------------------------------------ daemon --
 
 
 class Daemon:
     def __init__(self):
         self.conn = None
+        self.conn_lost = False
         self.buf = b""
         self.last_rx = time.time()
         self.last_clip_key = None
         self._send_lock = threading.Lock()
+        self._txq = queue.Queue(maxsize=4096)
+        threading.Thread(target=self._writer_loop, daemon=True, name="writer").start()
         self.remote_w, self.remote_h = detect_screen()
         save_json(SCREEN_FILE, w=self.remote_w, h=self.remote_h)
 
@@ -305,6 +696,9 @@ class Daemon:
         self.keyboard = None
         log("tela %dx%d; uinput sera criado ao entrar no Linux" % (self.remote_w, self.remote_h))
 
+        self.client_w = self.client_h = None
+        self.inbound_cap = False
+        self.guest_input = None
         self.active = False
         self.pressed_keys = set()
         self.pressed_buttons = set()
@@ -328,6 +722,8 @@ class Daemon:
     def move(self, x, y):
         self.ensure_devices()
         self.active = True
+        if self.guest_input is not None:
+            self.guest_input.note_abs(x, y)
         self.mouse.move_abs(x, y, self.remote_w, self.remote_h)
 
     def button(self, btn, down):
@@ -354,13 +750,50 @@ class Daemon:
 
     # ---- rede ----
     def send(self, msg_type, payload=b""):
-        with self._send_lock:
-            if self.conn is None:
-                return
+        """Enfileira o frame; quem escreve no socket e a thread 'writer'.
+        Nunca bloqueia o chamador (guest/evdev). Fila cheia: descarta Pointer."""
+        conn = self.conn
+        if conn is None:
+            return
+        frame = struct.pack("<BI", msg_type, len(payload)) + payload
+        item = (conn, frame)   # amarrado a conexao: nao vaza para a proxima
+        try:
+            self._txq.put_nowait(item)
+        except queue.Full:
+            if msg_type != 3:
+                try:
+                    self._txq.put(item, timeout=0.2)
+                except queue.Full:
+                    log("fila de envio cheia, frame tipo %d perdido" % msg_type)
+
+    def _writer_loop(self):
+        while True:
+            conn, frame = self._txq.get()
+            if conn is None or conn is not self.conn:
+                continue      # conexao mudou/caiu: descarta
             try:
-                self.conn.sendall(struct.pack("<BI", msg_type, len(payload)) + payload)
-            except OSError:
-                self.conn = None
+                with self._send_lock:
+                    conn.settimeout(WRITE_TIMEOUT)
+                    conn.sendall(frame)
+            except (OSError, ssl.SSLError) as e:
+                log("escrita falhou/timeout, derrubando conexao:", e)
+                self._drop_conn(conn)
+
+    def _drop_conn(self, conn):
+        if self.conn is conn:
+            self.conn = None
+            self.conn_lost = True   # tcp_loop faz leave()+guest_reset()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _clear_txq(self):
+        try:
+            while True:
+                self._txq.get_nowait()
+        except queue.Empty:
+            pass
 
     def handle(self, msg_type, payload):
         if msg_type == 9:
@@ -377,7 +810,11 @@ class Daemon:
         elif msg_type == 1:
             info = json.loads(payload)
             log("cliente:", info.get("name"), info.get("w"), "x", info.get("h"))
-            self.send(2, json.dumps({"v": 1, "name": socket.gethostname(),
+            self.client_w, self.client_h = info.get("w"), info.get("h")
+            caps = info.get("caps") or []
+            self.inbound_cap = info.get("v", 1) >= 2 and "inbound" in caps
+            log("inbound (Linux controlar Windows):", "permitido" if self.inbound_cap else "nao permitido")
+            self.send(2, json.dumps({"v": 2, "name": socket.gethostname(),
                                      "w": self.remote_w, "h": self.remote_h}).encode())
             threading.Thread(target=self.sync_clipboard, daemon=True).start()
         elif msg_type == 3:
@@ -393,8 +830,35 @@ class Daemon:
         elif msg_type == 6:
             code, down = struct.unpack("<HB", payload)
             self.key(code, bool(down))
+        elif msg_type == 13:
+            try:
+                epoch = json.loads(payload).get("epoch")
+            except Exception:
+                return
+            if self.guest_input is not None:
+                self.guest_input.on_ack(epoch)
         elif msg_type == 7:
+            # Windows devolveu o controle (se estavamos no modo guest) ou
+            # saiu do Linux (modo normal). Leave com epoch so pertence ao guest.
+            epoch = None
+            if payload:
+                try:
+                    epoch = json.loads(payload).get("epoch")
+                except Exception:
+                    epoch = None
+            if self.guest_input is not None and epoch is not None:
+                self.guest_input.on_remote_leave(epoch)
+                return
+            if self.guest_input is not None and self.guest_input.guest:
+                self.guest_input.exit(False, "Windows devolveu o controle")
             self.leave()
+
+    def guest_reset(self):
+        self.client_w = self.client_h = None
+        self.inbound_cap = False
+        if self.guest_input is not None:
+            self.guest_input.exit(False, "conexao perdida")
+            self.guest_input.cancel_pending("conexao perdida", False)
 
     def tcp_loop(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -408,6 +872,11 @@ class Daemon:
 
         while True:
             if self.conn is None:
+                if self.conn_lost:
+                    self.conn_lost = False
+                    log("conexao perdida (writer), limpando estado")
+                    self.leave()
+                    self.guest_reset()
                 try:
                     raw, addr = srv.accept()
                 except socket.timeout:
@@ -417,8 +886,13 @@ class Daemon:
                     time.sleep(0.2)
                     continue
                 try:
-                    self.conn = ctx.wrap_socket(raw, server_side=True)
+                    tls = ctx.wrap_socket(raw, server_side=True)
+                    self.leave()
+                    self.guest_reset()
+                    self.conn_lost = False
+                    self.conn = tls
                     self.buf = b""
+                    self._clear_txq()
                     self.last_rx = time.time()
                     log("conectado:", addr[0])
                 except (ssl.SSLError, OSError) as e:
@@ -438,6 +912,7 @@ class Daemon:
             if silencio > HEARTBEAT_TIMEOUT:
                 log("cliente sem heartbeat por %.0fs, derrubando conexao" % silencio)
                 self.leave()
+                self.guest_reset()
                 try:
                     self.conn.close()
                 except Exception:
@@ -447,10 +922,13 @@ class Daemon:
                 continue
 
             try:
-                r, _, _ = select.select([self.conn], [], [], 0.2)
-                if self.conn not in r:
+                conn = self.conn
+                if conn is None:
                     continue
-                chunk = self.conn.recv(65536)
+                r, _, _ = select.select([conn], [], [], 0.2)
+                if conn not in r:
+                    continue
+                chunk = conn.recv(65536)
                 if not chunk:
                     raise ConnectionError("fim")
                 self.last_rx = time.time()
@@ -465,11 +943,12 @@ class Daemon:
                         self.handle(mt, payload)
                     except Exception as e:
                         log("erro no evento", mt, e)
-            except (OSError, ConnectionError, ssl.SSLError) as e:
+            except (OSError, ConnectionError, ssl.SSLError, ValueError) as e:
                 log("desconectado:", e)
                 self.leave()
+                self.guest_reset()
                 try:
-                    self.conn.close()
+                    conn.close()
                 except Exception:
                     pass
                 self.conn = None
@@ -565,6 +1044,26 @@ if __name__ == "__main__":
     d = Daemon()
     Discovery(d).start()
     cfg = load_json(CONF_FILE) or {}
+    if cfg.get("GuestEnabled", True):
+        gedge = str(cfg.get("GuestEdge", "bottom")).strip().lower()
+        if gedge not in OPPOSITE:
+            log("GuestEdge invalida (%r), usando bottom" % gedge)
+            gedge = "bottom"
+        try:
+            gdelay = int(cfg.get("GuestSwitchDelayMs", 250))
+        except (TypeError, ValueError):
+            log("GuestSwitchDelayMs invalido, usando 250")
+            gdelay = 250
+        try:
+            gspeed = float(cfg.get("GuestSpeed", 1.0))
+        except (TypeError, ValueError):
+            log("GuestSpeed invalido, usando 1.0")
+            gspeed = 1.0
+        d.guest_input = GuestInput(d, gedge, gdelay, gspeed)
+        d.guest_input.start()
+        log("guest (KVM bidirecional) ligado: borda %s" % gedge)
+    else:
+        log("guest (KVM bidirecional) desligado (GuestEnabled=false)")
     if cfg.get("clipboard", "pull") == "poll":
         threading.Thread(target=d.clip_loop, daemon=True, name="clip").start()
         log("clipboard em modo poll (1s)")
