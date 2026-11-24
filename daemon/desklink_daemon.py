@@ -15,6 +15,7 @@ Protocolo: [u8 tipo][u32 tamanho LE][payload]
   5 Wheel i32,i32 | 6 Key u16,u8 | 7 Leave | 8 Heartbeat | 9 Clipboard UTF-8
   10 ClipboardImage PNG | 11 PullClipboard | 12 Hosting JSON {"edge","w","h","epoch"}
   13 HostingAck JSON {"epoch"} (Windows -> Linux)
+  14 PointerRel i32,i32 (dx,dy em pixels do Windows ja escalados; modo guest)
 
 KVM bidirecional (modo "guest"): o daemon tambem le o teclado/mouse FISICOS do
 Linux (evdev, sem dependencias) e, ao empurrar o ponteiro alem de GuestEdge,
@@ -455,7 +456,7 @@ class GuestInput(threading.Thread):
                 return
             self.pending = False
             self.guest = True
-        self.d.send(3, struct.pack("<ii", int(self.gx), int(self.gy)))
+        self.d.send(14, struct.pack("<ii", 0, 0))
         log("guest: controlando o Windows (borda %s)" % self.edge)
 
     def cancel_pending(self, reason, notify):
@@ -671,14 +672,22 @@ class GuestInput(threading.Thread):
         xhi = cw - 1 + (GUEST_OVERSHOOT if opp == "right" else 0)
         ylo = -GUEST_OVERSHOOT if opp == "top" else 0
         yhi = ch - 1 + (GUEST_OVERSHOOT if opp == "bottom" else 0)
+        ox, oy = self.gx, self.gy
         self.gx = max(xlo, min(xhi, nx))
         self.gy = max(ylo, min(yhi, ny))
-        self.d.send(3, struct.pack("<ii", int(self.gx), int(self.gy)))
+        # delta inteiro em pixels do Windows; o resto fracionario fica em gx/gy
+        rx = int(self.gx) - int(ox)
+        ry = int(self.gy) - int(oy)
+        if rx or ry:
+            self.d.send(14, struct.pack("<ii", rx, ry))
 
-PTR_MIN_INTERVAL = 0.008   # Pointer enviado no maximo a ~120 Hz
+PTR_MIN_INTERVAL = 0.008   # Pointer absoluto enviado no maximo a ~120 Hz
+REL_MIN_INTERVAL = 0.002   # PointerRel enviado no maximo a ~500 Hz
 
 
 # ------------------------------------------------------------------ daemon --
+
+_REL_MARK = object()   # marcador de PointerRel na fila de envio
 
 
 class Daemon:
@@ -694,6 +703,9 @@ class Daemon:
         self._ptr_pending = None      # (conn, x, y): so a ultima posicao importa
         self._ptr_queued = False      # ja existe marcador de Pointer na fila
         self._ptr_last = 0.0
+        self._rel_pending = None      # (conn, dx, dy): deltas somados
+        self._rel_queued = False
+        self._rel_last = 0.0
         threading.Thread(target=self._writer_loop, daemon=True, name="writer").start()
         self.remote_w, self.remote_h = detect_screen()
         save_json(SCREEN_FILE, w=self.remote_w, h=self.remote_h)
@@ -778,6 +790,24 @@ class Daemon:
                 with self._ptr_lock:
                     self._ptr_queued = False
             return
+        if msg_type == 14 and len(payload) == 8:
+            # coalescencia por soma: nenhum delta se perde
+            dx, dy = struct.unpack("<ii", payload)
+            with self._ptr_lock:
+                p = self._rel_pending
+                if p is not None and p[0] is conn:
+                    dx += p[1]
+                    dy += p[2]
+                self._rel_pending = (conn, dx, dy)
+                if self._rel_queued:
+                    return
+                self._rel_queued = True
+            try:
+                self._txq.put_nowait((conn, _REL_MARK))
+            except queue.Full:
+                with self._ptr_lock:
+                    self._rel_queued = False
+            return
         frame = struct.pack("<BI", msg_type, len(payload)) + payload
         item = (conn, frame)   # amarrado a conexao: nao vaza para a proxima
         try:
@@ -792,7 +822,21 @@ class Daemon:
     def _writer_loop(self):
         while True:
             conn, frame = self._txq.get()
-            if frame is None:
+            if frame is _REL_MARK:
+                wait = REL_MIN_INTERVAL - (time.monotonic() - self._rel_last)
+                if wait > 0:
+                    time.sleep(wait)
+                with self._ptr_lock:
+                    pend = self._rel_pending
+                    self._rel_pending = None
+                    self._rel_queued = False
+                if pend is None:
+                    continue
+                conn, dx, dy = pend
+                payload = struct.pack("<ii", dx, dy)
+                frame = struct.pack("<BI", 14, len(payload)) + payload
+                self._rel_last = time.monotonic()
+            elif frame is None:
                 # marcador de Pointer: limita a ~120 Hz e envia so a posicao mais recente
                 wait = PTR_MIN_INTERVAL - (time.monotonic() - self._ptr_last)
                 if wait > 0:
@@ -830,6 +874,8 @@ class Daemon:
         with self._ptr_lock:
             self._ptr_pending = None
             self._ptr_queued = False
+            self._rel_pending = None
+            self._rel_queued = False
         try:
             while True:
                 self._txq.get_nowait()
@@ -927,6 +973,7 @@ class Daemon:
                     time.sleep(0.2)
                     continue
                 try:
+                    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     tls = ctx.wrap_socket(raw, server_side=True)
                     self.leave()
                     self.guest_reset()

@@ -260,7 +260,7 @@ No Linux, `~/.config/desklink/config.json` (opcional):
 | `GuestSwitchDelayMs` | `250` | Tempo empurrando contra a borda antes de trocar |
 | `GuestSpeed` | `1.0` | Multiplicador do movimento do mouse no Windows |
 
-> Suavidade (v0.2.2): o daemon coalesce os movimentos do mouse (último vence, até ~120 Hz) e escala o movimento pela razão entre as telas. Se o cursor no Windows estiver rápido ou lento demais, ajuste `GuestSpeed` (ex.: `0.8` ou `1.3`).
+> Suavidade (v0.2.3): o daemon envia deltas (`PointerRel`, msg 14) somados e coalescidos (até ~500 Hz, `TCP_NODELAY`) e escala o movimento pela razão entre as telas. Se o cursor no Windows estiver rápido ou lento demais, ajuste `GuestSpeed` (ex.: `0.8` ou `1.3`).
 
 Depois de editar: `Stop-ScheduledTask DeskLink; Start-ScheduledTask DeskLink`.
 
@@ -289,9 +289,10 @@ Cada mensagem: `[u8 tipo][u32 tamanho LE][payload]`.
 | 11 | `PullClipboard` | — (pede o clipboard do Linux) | W → L |
 | 12 | `Hosting` | JSON `{edge,w,h,epoch}`: o Linux pede para assumir o Windows (KVM bidirecional) | L → W |
 | 13 | `HostingAck` | JSON `{epoch}`: o Windows aceitou; só então o Linux captura (`EVIOCGRAB`) | W → L |
+| 14 | `PointerRel` | `i32 dx, i32 dy` (pixels do Windows já escalados; modo guest, aplicado com `SendInput MOVE`) | L → W |
 
-No modo guest (veja *Uso bidirecional*), as mensagens 3–6 também seguem **L → W**:
-O Windows só trata 3–6 dentro de uma sessão iniciada por `Hosting` (12) e aceita (13); fora dela descarta.
+No modo guest (veja *Uso bidirecional*), as mensagens 3–6 e 14 também seguem **L → W**:
+O Windows só trata 3–6 e 14 dentro de uma sessão iniciada por `Hosting` (12) e aceita (13); fora dela descarta.
 `Pointer` em **pixels do Windows** (pode sair da tela até 100 px na borda de saída, para
 o Windows medir o empurrão), `Key` com keycodes evdev. O Windows injeta com `SendInput`.
 

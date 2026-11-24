@@ -185,7 +185,7 @@ internal sealed class LinkClient
     }
 
     private static bool IsInputFrame(byte type) =>
-        type is Proto.Pointer or Proto.Button or Proto.Wheel or Proto.Key or Proto.Leave or Proto.Hosting;
+        type is Proto.Pointer or Proto.PointerRel or Proto.Button or Proto.Wheel or Proto.Key or Proto.Leave or Proto.Hosting;
 
     private void Pump()
     {

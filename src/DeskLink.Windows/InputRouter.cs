@@ -37,6 +37,8 @@ internal sealed class InputRouter
     private string _inboundEdge = "top";   // borda de saida do Windows (oposta a do Linux)
     private int _ix;
     private int _iy;
+    private int _vx;   // posicao virtual do Linux (pode passar da borda de saida)
+    private int _vy;
     private int _inOverflow;
     private readonly HashSet<int> _inKeys = new();
     private readonly HashSet<int> _inButtons = new();
@@ -292,7 +294,7 @@ internal sealed class InputRouter
 
     // ------------------------------------------------ entrada do Linux -------
     // Chamado na thread de leitura do LinkClient. Msgs: 12 Hosting (Linux assumiu),
-    // 3 Pointer (absoluto em pixels do Windows, pode sair da tela na borda de
+    // 14 PointerRel (delta em pixels, SendInput MOVE), 3 Pointer (absoluto em pixels do Windows, pode sair da tela na borda de
     // saida), 4 Button, 5 Wheel, 6 Key (evdev), 7 Leave (Linux devolveu o controle).
     public void OnInbound(byte type, byte[] payload)
     {
@@ -302,6 +304,7 @@ internal sealed class InputRouter
 
             bool move = false;
             int mx = 0, my = 0;
+            int rdx = 0, rdy = 0;
             lock (_inLock)
             {
                 if (type == Proto.Hosting)
@@ -324,6 +327,10 @@ internal sealed class InputRouter
                         move = InboundPointer(BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4), out mx, out my);
                         break;
 
+                    case Proto.PointerRel when payload.Length >= 8:
+                        InboundPointerRel(BitConverter.ToInt32(payload, 0), BitConverter.ToInt32(payload, 4), out rdx, out rdy);
+                        break;
+
                     case Proto.Button when payload.Length >= 2:
                         InboundButton(payload[0], payload[1] != 0);
                         break;
@@ -340,6 +347,8 @@ internal sealed class InputRouter
 
             // movimento fora do lock: so a posicao mais recente importa
             if (move) Native.SetCursorPos(mx, my);
+            // movimento relativo: SendInput MOVE (sem SetCursorPos, sem reposicionar)
+            if (rdx != 0 || rdy != 0) SendMouseMove(rdx, rdy);
         }
         catch (Exception ex)
         {
@@ -458,9 +467,40 @@ internal sealed class InputRouter
 
         _ix = Math.Clamp(x, 0, w - 1);
         _iy = Math.Clamp(y, 0, h - 1);
+        SyncVirtual(x, y, w, h);
         px = _ix;
         py = _iy;
         return true;
+    }
+
+    // Virtual so passa da tela na borda de saida; nas demais, fica preso a tela.
+    private void SyncVirtual(int x, int y, int w, int h)
+    {
+        int m = InboundExitOverflow;
+        _vx = Math.Clamp(x, _inboundEdge == "left" ? -m : 0, w - 1 + (_inboundEdge == "right" ? m : 0));
+        _vy = Math.Clamp(y, _inboundEdge == "top" ? -m : 0, h - 1 + (_inboundEdge == "bottom" ? m : 0));
+    }
+
+    // Sob _inLock: aplica o delta (pixels) na posicao virtual, trata o exit por overflow
+    // e devolve o delta efetivo (limitado pela tela) a enviar via SendInput.
+    private void InboundPointerRel(int dx, int dy, out int ax, out int ay)
+    {
+        ax = ay = 0;
+        int w = Math.Max(2, _screenW);
+        int h = Math.Max(2, _screenH);
+        long nx = (long)_vx + dx, ny = (long)_vy + dy;
+        int x = (int)Math.Clamp(nx, -10000, 10000), y = (int)Math.Clamp(ny, -10000, 10000);
+        int oldX = _ix, oldY = _iy;
+        if (!InboundPointer(x, y, out int px, out int py)) return;
+        ax = px - oldX;
+        ay = py - oldY;
+    }
+
+    private static void SendMouseMove(int dx, int dy)
+    {
+        var i = new Native.INPUT { type = Native.INPUT_MOUSE };
+        i.mi = new Native.MOUSEINPUT { dx = dx, dy = dy, dwFlags = Native.MOUSEEVENTF_MOVE };
+        Send(i);
     }
 
     private static void Send(Native.INPUT input)

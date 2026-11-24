@@ -10,7 +10,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>DeskLink</AssemblyName>
-    <Version>0.2.2</Version>
+    <Version>0.2.3</Version>
     <RootNamespace>DeskLink</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
